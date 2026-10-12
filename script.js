@@ -4,21 +4,11 @@
   if (!slider) return;
 
   const slides = Array.from(slider.querySelectorAll("[data-slide]"));
-  const indicators = Array.from(slider.querySelectorAll("[data-slide-to]"));
-  const previousButton = slider.querySelector("[data-slider-prev]");
-  const nextButton = slider.querySelector("[data-slider-next]");
   const video = slider.querySelector("[data-hero-video]");
   const appUrl = slider.dataset.appUrl?.trim();
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
-  if (
-    slides.length === 0 ||
-    indicators.length !== slides.length ||
-    !previousButton ||
-    !nextButton
-  ) {
-    return;
-  }
+  if (slides.length === 0) return;
 
   if (appUrl) {
     slider.querySelectorAll("[data-app-link]").forEach((link) => {
@@ -31,9 +21,7 @@
     slides.findIndex((slide) => slide.classList.contains("is-active")),
   );
   let autoplayTimer = null;
-  let pointerInside = false;
   let focusInside = false;
-  let userPausedAutoplay = false;
 
   function showSlide(index) {
     activeIndex = (index + slides.length) % slides.length;
@@ -51,12 +39,6 @@
       }
     });
 
-    indicators.forEach((indicator, indicatorIndex) => {
-      const isActive = indicatorIndex === activeIndex;
-
-      indicator.classList.toggle("is-active", isActive);
-      indicator.setAttribute("aria-current", String(isActive));
-    });
   }
 
   function stopAutoplay() {
@@ -70,9 +52,7 @@
     const mayAutoplay =
       !reducedMotion.matches &&
       !document.hidden &&
-      !pointerInside &&
-      !focusInside &&
-      !userPausedAutoplay;
+      !focusInside;
 
     if (!mayAutoplay) {
       stopAutoplay();
@@ -85,36 +65,6 @@
       }, 6000);
     }
   }
-
-  function navigateManually(index) {
-    userPausedAutoplay = true;
-    showSlide(index);
-    syncAutoplay();
-  }
-
-  previousButton.addEventListener("click", () => {
-    navigateManually(activeIndex - 1);
-  });
-
-  nextButton.addEventListener("click", () => {
-    navigateManually(activeIndex + 1);
-  });
-
-  indicators.forEach((indicator, index) => {
-    indicator.addEventListener("click", () => {
-      navigateManually(index);
-    });
-  });
-
-  slider.addEventListener("pointerenter", () => {
-    pointerInside = true;
-    syncAutoplay();
-  });
-
-  slider.addEventListener("pointerleave", () => {
-    pointerInside = false;
-    syncAutoplay();
-  });
 
   slider.addEventListener("focusin", () => {
     focusInside = true;
