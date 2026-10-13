@@ -77,6 +77,41 @@ function sendVerificationCode(string $email, string $firstName, string $code): v
     $mailer->send();
 }
 
+function sendPasswordResetCode(string $email, string $firstName, string $code): void
+{
+    $port = filter_var($_ENV['SMTP_PORT'] ?? '587', FILTER_VALIDATE_INT);
+    if ($port === false || $port < 1 || $port > 65535) {
+        throw new RuntimeException('Le port SMTP configuré est invalide.');
+    }
+
+    $mailer = new PHPMailer(true);
+    $mailer->isSMTP();
+    $mailer->Host = envRequired('SMTP_HOST');
+    $mailer->SMTPAuth = true;
+    $mailer->Username = envRequired('SMTP_USERNAME');
+    $mailer->Password = envRequired('SMTP_PASSWORD');
+    $mailer->Port = $port;
+    $mailer->CharSet = PHPMailer::CHARSET_UTF8;
+
+    $secure = strtolower($_ENV['SMTP_SECURE'] ?? 'tls');
+    if ($secure === 'tls') {
+        $mailer->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+    } elseif ($secure === 'ssl') {
+        $mailer->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
+    } else {
+        throw new RuntimeException('SMTP_SECURE doit valoir tls ou ssl.');
+    }
+
+    $mailer->setFrom(envRequired('MAIL_FROM_ADDRESS'), $_ENV['MAIL_FROM_NAME'] ?? 'La bibliothèque');
+    $mailer->addAddress($email, $firstName);
+    $mailer->Subject = 'Réinitialisation du mot de passe';
+    $mailer->Body = "Bonjour {$firstName},\n\n"
+        . "Vous avez demandé une réinitialisation de votre mot de passe.\n"
+        . "Votre code de vérification est : {$code}\n"
+        . "Il est valable pendant 10 minutes. Si vous n'êtes pas à l'origine de cette demande, ignorez ce message.";
+    $mailer->send();
+}
+
 function newVerificationCode(): string
 {
     return str_pad((string) random_int(0, 99999999), 8, '0', STR_PAD_LEFT);
@@ -98,6 +133,36 @@ function storeVerificationCode(PDO $database, int $userId, string $code): void
         'user_id' => $userId,
         'code_hash' => password_hash($code, PASSWORD_DEFAULT),
     ]);
+}
+
+function generateLogin(PDO $database, string $email, string $firstName, string $lastName): string
+{
+    $base = strtolower(trim(($firstName !== '' ? $firstName : '') . '.' . ($lastName !== '' ? $lastName : '')));
+    $base = preg_replace('/[^a-z0-9.]/u', '', $base) ?? 'lecteur';
+    $base = trim($base, '.');
+
+    if ($base === '' || $base === '.') {
+        $parts = explode('@', $email);
+        $base = preg_replace('/[^a-z0-9]/u', '', $parts[0] ?? 'lecteur') ?? 'lecteur';
+    }
+
+    $login = $base === '' ? 'lecteur' : $base;
+    $attempt = 0;
+
+    while (true) {
+        $statement = $database->prepare('SELECT 1 FROM utilisateur WHERE login = :login LIMIT 1');
+        $statement->execute(['login' => $login]);
+        if (!$statement->fetch()) {
+            return $login;
+        }
+
+        $attempt++;
+        $login = $base . '-' . substr(bin2hex(random_bytes(2)), 0, 4);
+        if ($attempt > 10) {
+            $login = $base . '-' . bin2hex(random_bytes(4));
+            return $login;
+        }
+    }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -139,7 +204,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($action === 'register') {
-            $login = trim((string) ($_POST['login'] ?? ''));
             $firstName = trim((string) ($_POST['prenom'] ?? ''));
             $lastName = trim((string) ($_POST['nom'] ?? ''));
             $email = trim((string) ($_POST['email'] ?? ''));
@@ -148,7 +212,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $passwordConfirmation = (string) ($_POST['password_confirmation'] ?? '');
 
             $values = [
-                'login' => $login,
                 'prenom' => $firstName,
                 'nom' => $lastName,
                 'email' => $email,
@@ -156,8 +219,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ];
 
             if (
-                !preg_match('/^[\p{L}\p{N}_.-]{3,50}$/u', $login)
-                || mb_strlen($firstName) < 1 || mb_strlen($firstName) > 50
+                mb_strlen($firstName) < 1 || mb_strlen($firstName) > 50
                 || mb_strlen($lastName) < 1 || mb_strlen($lastName) > 50
                 || !filter_var($email, FILTER_VALIDATE_EMAIL) || mb_strlen($email) > 100
                 || mb_strlen($phone) > 20
@@ -179,6 +241,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $database->beginTransaction();
+            $login = generateLogin($database, $email, $firstName, $lastName);
+
             $statement = $database->prepare(
                 'INSERT INTO utilisateur (login, email, mot_de_passe_hash, role, email_verifie) '
                 . 'VALUES (:login, :email, :password_hash, :role, 0)'
@@ -322,6 +386,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirectTo('verify');
         }
 
+        if ($action === 'forgot') {
+            $email = trim((string) ($_POST['email'] ?? ''));
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                setFlash('error', 'Saisissez une adresse e-mail valide.');
+                redirectTo('login');
+            }
+
+            $statement = $database->prepare(
+                'SELECT u.id_utilisateur, a.prenom FROM utilisateur u '
+                . 'JOIN adherent a ON a.id_utilisateur = u.id_utilisateur '
+                . 'WHERE u.email = :email LIMIT 1'
+            );
+            $statement->execute(['email' => $email]);
+            $user = $statement->fetch();
+
+            if (!$user) {
+                setFlash('success', 'Si cette adresse existe, un code de réinitialisation a été envoyé.');
+                redirectTo('login');
+            }
+
+            $code = newVerificationCode();
+            storeVerificationCode($database, (int) $user['id_utilisateur'], $code);
+
+            try {
+                sendPasswordResetCode($email, $user['prenom'], $code);
+                $_SESSION['pending_email'] = $email;
+                setFlash('success', 'Si cette adresse existe, un code de réinitialisation a été envoyé.');
+            } catch (MailException | RuntimeException $exception) {
+                error_log('Échec de l’envoi du code de réinitialisation : ' . $exception->getMessage());
+                setFlash('error', 'Le code n’a pas pu être envoyé. Vérifiez la configuration SMTP.');
+            }
+            redirectTo('login');
+        }
+
         if ($action === 'logout') {
             $_SESSION = [];
             session_regenerate_id(true);
@@ -339,7 +437,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($exception->getCode() === '23000') {
             $_SESSION['form_values'] = [
-                'login' => trim((string) ($_POST['login'] ?? '')),
                 'prenom' => trim((string) ($_POST['prenom'] ?? '')),
                 'nom' => trim((string) ($_POST['nom'] ?? '')),
                 'email' => trim((string) ($_POST['email'] ?? '')),
@@ -388,6 +485,12 @@ $pageTitles = [
   <meta name="theme-color" content="#24483f">
   <title><?= escape($pageTitles[$view]) ?> — La bibliothèque</title>
   <link rel="stylesheet" href="auth.css">
+  <style>
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 50; }
+    .modal[aria-hidden="false"] { display: flex; }
+    .modal__panel { background: #fff; padding: 1.5rem; border-radius: 8px; width: min(90vw, 420px); }
+    .text-button { background: transparent; border: 0; padding: 0; color: #24483f; text-decoration: underline; cursor: pointer; }
+  </style>
 </head>
 <body>
   <main class="auth-layout">
@@ -426,6 +529,7 @@ $pageTitles = [
             <button class="auth-button" type="submit">Se connecter <span aria-hidden="true">→</span></button>
           </form>
           <p class="auth-switch">Vous n’avez pas encore de compte ? <a href="index.php?view=register">Créer un compte</a></p>
+          <p class="auth-switch"><a href="#" id="forgot-link">Mot de passe oublié ?</a></p>
 
         <?php elseif ($view === 'register'): ?>
           <p class="auth-eyebrow auth-eyebrow--dark">Rejoignez-nous</p>
@@ -444,8 +548,6 @@ $pageTitles = [
                 <input id="register-last-name" name="nom" autocomplete="family-name" maxlength="50" required value="<?= escape((string) ($formValues['nom'] ?? '')) ?>">
               </div>
             </div>
-            <label for="register-login">Identifiant</label>
-            <input id="register-login" name="login" autocomplete="username" minlength="3" maxlength="50" required value="<?= escape((string) ($formValues['login'] ?? '')) ?>">
             <label for="register-email">Adresse e-mail</label>
             <input id="register-email" name="email" type="email" autocomplete="email" maxlength="100" required value="<?= escape((string) ($formValues['email'] ?? '')) ?>">
             <label for="register-phone">Téléphone <span class="optional">(facultatif)</span></label>
@@ -490,5 +592,53 @@ $pageTitles = [
       <p class="auth-footer">© 2026 La bibliothèque · <a href="index.html">Retour au site</a></p>
     </section>
   </main>
+
+  <div class="modal" id="forgot-modal" aria-hidden="true" role="dialog" aria-modal="true">
+    <div class="modal__panel" role="document">
+      <h3>Réinitialiser le mot de passe</h3>
+      <p>Entrez votre adresse e-mail pour recevoir un code de réinitialisation.</p>
+      <form method="post" action="index.php">
+        <input type="hidden" name="csrf_token" value="<?= escape($_SESSION['csrf_token']) ?>">
+        <input type="hidden" name="action" value="forgot">
+        <label for="forgot-email">Adresse e-mail</label>
+        <input id="forgot-email" name="email" type="email" autocomplete="email" required>
+        <div style="display:flex;gap:8px;margin-top:1rem;align-items:center;">
+          <button class="auth-button" type="submit">Envoyer le code</button>
+          <button type="button" class="text-button" id="forgot-cancel">Annuler</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const forgotLink = document.getElementById('forgot-link');
+      const modal = document.getElementById('forgot-modal');
+      const cancel = document.getElementById('forgot-cancel');
+      const emailField = document.getElementById('forgot-email');
+
+      if (forgotLink && modal) {
+        forgotLink.addEventListener('click', function (event) {
+          event.preventDefault();
+          modal.setAttribute('aria-hidden', 'false');
+          if (emailField) emailField.focus();
+        });
+      }
+
+      if (cancel && modal) {
+        cancel.addEventListener('click', function () {
+          modal.setAttribute('aria-hidden', 'true');
+        });
+      }
+
+      if (modal) {
+        modal.addEventListener('click', function (event) {
+          if (event.target === modal) {
+            modal.setAttribute('aria-hidden', 'true');
+          }
+        });
+      }
+    }());
+  </script>
 </body>
 </html>
